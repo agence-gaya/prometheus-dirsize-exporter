@@ -146,7 +146,7 @@ def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument(
         "parent_dir",
-        help="The directory to whose subdirectories will have their information exported",
+        help="The directories, comma separated, to whose subdirectories will have their information exported",
     )
     argparser.add_argument(
         "iops_budget", help="Number of IO operations allowed per second", type=int
@@ -174,18 +174,19 @@ def main():
     start_http_server(args.port)
     while True:
         walker = BudgetedDirInfoWalker(args.iops_budget)
-        for subdir_info in walker.get_subdirs_info(args.parent_dir):
-            metrics.TOTAL_SIZE.labels(subdir_info.path).set(subdir_info.size)
-            metrics.LATEST_MTIME.labels(subdir_info.path).set(subdir_info.latest_mtime)
-            metrics.ENTRIES_COUNT.labels(subdir_info.path).set(
-                subdir_info.entries_count
-            )
-            if args.enable_detailed_processing_time_metric:
-                metrics.PROCESSING_TIME.labels(subdir_info.path).set(
-                    subdir_info.processing_time
+        for base_dir in args.parent_dir.split(','):
+            for subdir_info in walker.get_subdirs_info(base_dir):
+                metrics.TOTAL_SIZE.labels(directory=subdir_info.path, base=base_dir).set(subdir_info.size)
+                metrics.LATEST_MTIME.labels(directory=subdir_info.path, base=base_dir).set(subdir_info.latest_mtime)
+                metrics.ENTRIES_COUNT.labels(directory=subdir_info.path, base=base_dir).set(
+                    subdir_info.entries_count
                 )
-            metrics.LAST_UPDATED.labels(subdir_info.path).set(time.time())
-            print(f"Updated values for {subdir_info.path}")
+                if args.enable_detailed_processing_time_metric:
+                    metrics.PROCESSING_TIME.labels(directory=subdir_info.path, base=base_dir).set(
+                        subdir_info.processing_time
+                    )
+                metrics.LAST_UPDATED.labels(directory=subdir_info.path, base=base_dir).set(time.time())
+                print(f"Updated values for {subdir_info.path} in {base_dir}")
         time.sleep(args.wait_time_minutes * 60)
 
 
