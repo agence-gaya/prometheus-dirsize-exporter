@@ -141,6 +141,10 @@ class BudgetedDirInfoWalker:
                 return None
             # Any other permission error should be propagated
             raise
+        except FileNotFoundError as e:
+            # File has been renamed or deleted between list and getting information
+            # We can skip this silently
+            return None
 
 def main():
     argparser = argparse.ArgumentParser()
