@@ -196,6 +196,30 @@ def save_state(state_file: str, state: dict):
         print(f"Could not save state file {state_file}: {e}")
 
 
+def remove_stale_entries(
+    base_dir: str, state: dict, stale_paths: set[str], disable_total_size: bool
+):
+    """
+    Remove directories that no longer exist (deleted between iterations) from
+    both the saved state and the exposed prometheus metrics, so they do not
+    linger forever with stale values.
+    """
+    for path in stale_paths:
+        del state[base_dir][path]
+        gauges = [metrics.LATEST_MTIME, metrics.OLDEST_MTIME, metrics.ENTRIES_COUNT, metrics.PROCESSING_TIME, metrics.LAST_UPDATED]
+        if not disable_total_size:
+            gauges.append(metrics.TOTAL_SIZE)
+        for gauge in gauges:
+            try:
+                gauge.remove(path, base_dir)
+            except KeyError:
+                # This directory never had a value set for this particular
+                # metric (e.g. processing time when detailed metric is
+                # disabled), nothing to remove.
+                pass
+        print(f"Removed stale entry for {path} in {base_dir} (directory no longer exists)")
+
+
 def apply_state_to_metrics(
     state: dict, enable_detailed_processing_time_metric: bool, disable_total_size: bool
 ):
@@ -286,9 +310,11 @@ def main() -> Never:
         walker = BudgetedDirInfoWalker(args.iops_budget)
         for base_dir in args.parent_dir.split(','):
             state.setdefault(base_dir, {})
+            seen_paths = set()
             for subdir_info in walker.get_subdirs_info(base_dir):
                 if subdir_info is None:
                     continue
+                seen_paths.add(subdir_info.path)
                 if not args.disable_total_size:
                     metrics.TOTAL_SIZE.labels(directory=subdir_info.path, base=base_dir).set(subdir_info.size)
                 metrics.LATEST_MTIME.labels(directory=subdir_info.path, base=base_dir).set(subdir_info.latest_mtime)
@@ -311,6 +337,12 @@ def main() -> Never:
                     "last_updated": last_updated,
                 }
                 print(f"Updated values for {subdir_info.path} in {base_dir}")
+            # Any directory that was known in a previous iteration but was not
+            # seen in this one has been deleted: drop it from the state and
+            # from the exposed metrics so it does not linger with stale data.
+            stale_paths = set(state[base_dir].keys()) - seen_paths
+            if stale_paths:
+                remove_stale_entries(base_dir, state, stale_paths, args.disable_total_size)
         save_state(args.state_file, state)
         time.sleep(args.wait_time_minutes * 60)
 
