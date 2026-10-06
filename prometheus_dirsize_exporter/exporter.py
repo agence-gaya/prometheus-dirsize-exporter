@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import argparse
 from typing import Callable, Never, Optional, Generator
@@ -160,6 +161,72 @@ class BudgetedDirInfoWalker:
             # We can skip this silently
             return None
 
+
+def load_state(state_file: str) -> dict:
+    """
+    Load the previously saved state from disk, if it exists.
+
+    Returns an empty dict if the file does not exist or can not be read.
+    """
+    if not state_file or not os.path.exists(state_file):
+        return {}
+    try:
+        with open(state_file) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Could not load state file {state_file}, ignoring it: {e}")
+        return {}
+
+
+def save_state(state_file: str, state: dict):
+    """
+    Save the current state to disk, so it can be reloaded on next startup.
+
+    Written atomically (via a temporary file + rename) to avoid leaving a
+    corrupted state file behind if the process is killed mid-write.
+    """
+    if not state_file:
+        return
+    tmp_state_file = f"{state_file}.tmp"
+    try:
+        with open(tmp_state_file, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp_state_file, state_file)
+    except OSError as e:
+        print(f"Could not save state file {state_file}: {e}")
+
+
+def apply_state_to_metrics(
+    state: dict, enable_detailed_processing_time_metric: bool, disable_total_size: bool
+):
+    """
+    Push previously saved state into the prometheus metrics, so there is no
+    gap in the exposed metrics when the exporter restarts.
+    """
+    for base_dir, subdirs in state.items():
+        for path, info in subdirs.items():
+            if not disable_total_size:
+                metrics.TOTAL_SIZE.labels(directory=path, base=base_dir).set(info["size"])
+            metrics.LATEST_MTIME.labels(directory=path, base=base_dir).set(
+                info["latest_mtime"]
+            )
+            if "oldest_mtime" in info:
+                metrics.OLDEST_MTIME.labels(directory=path, base=base_dir).set(
+                    info["oldest_mtime"]
+                )
+            metrics.ENTRIES_COUNT.labels(directory=path, base=base_dir).set(
+                info["entries_count"]
+            )
+            if enable_detailed_processing_time_metric and "processing_time" in info:
+                metrics.PROCESSING_TIME.labels(directory=path, base=base_dir).set(
+                    info["processing_time"]
+                )
+            if "last_updated" in info:
+                metrics.LAST_UPDATED.labels(directory=path, base=base_dir).set(
+                    info["last_updated"]
+                )
+
+
 def main() -> Never:
     argparser = argparse.ArgumentParser()
     argparser.add_argument(
@@ -186,6 +253,14 @@ def main() -> Never:
     argparser.add_argument(
         "--port", help="Port for the server to listen on", type=int, default=8000
     )
+    argparser.add_argument(
+        "--state-file",
+        help="Path to a JSON file used to persist directory metrics between "
+        "restarts, so there is no gap in exposed metrics when the exporter "
+        "restarts. Disabled by default; state is only saved/loaded if this "
+        "option is explicitly provided.",
+        default=None,
+    )
 
     argparser.add_argument(
         "--disable-total-size",
@@ -199,10 +274,18 @@ def main() -> Never:
     if not args.disable_total_size:
         REGISTRY.register(metrics.TOTAL_SIZE)
 
+    state = load_state(args.state_file)
+    if state:
+        apply_state_to_metrics(
+            state, args.enable_detailed_processing_time_metric, args.disable_total_size
+        )
+        print(f"Loaded previous state from {args.state_file}")
+
     start_http_server(args.port)
     while True:
         walker = BudgetedDirInfoWalker(args.iops_budget)
         for base_dir in args.parent_dir.split(','):
+            state.setdefault(base_dir, {})
             for subdir_info in walker.get_subdirs_info(base_dir):
                 if subdir_info is None:
                     continue
@@ -217,8 +300,18 @@ def main() -> Never:
                     metrics.PROCESSING_TIME.labels(directory=subdir_info.path, base=base_dir).set(
                         subdir_info.processing_time
                     )
-                metrics.LAST_UPDATED.labels(directory=subdir_info.path, base=base_dir).set(time.time())
+                last_updated = time.time()
+                metrics.LAST_UPDATED.labels(directory=subdir_info.path, base=base_dir).set(last_updated)
+                state[base_dir][subdir_info.path] = {
+                    "size": subdir_info.size,
+                    "latest_mtime": subdir_info.latest_mtime,
+                    "oldest_mtime": subdir_info.oldest_mtime,
+                    "entries_count": subdir_info.entries_count,
+                    "processing_time": subdir_info.processing_time,
+                    "last_updated": last_updated,
+                }
                 print(f"Updated values for {subdir_info.path} in {base_dir}")
+        save_state(args.state_file, state)
         time.sleep(args.wait_time_minutes * 60)
 
 
